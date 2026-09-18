@@ -2148,6 +2148,131 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         # Nothing pinned: nothing to report, whatever the frames say.
         self.assertEqual(_wont_generalize({("TENSOR_MATCH", "x")}, guard_sets), ())
 
+    def test_varying_guard_slots_are_the_differing_and_present_in_some_ones(self):
+        from torch._dynamo.precompile_package import _varying_guard_slots
+        from torch.compiler._precompile_types import GuardFact
+
+        def fact(guard_type, source, code=(), value="", enforced=True):
+            return GuardFact(
+                guard_type=guard_type,
+                source=source,
+                code=code,
+                value=value,
+                enforced=enforced,
+            )
+
+        x_f32 = fact("TENSOR_MATCH", "L['x']", value="dtype=float32")
+        x_f16 = fact("TENSOR_MATCH", "L['x']", value="dtype=float16")
+        flag = fact("CONSTANT_MATCH", "L['flag']", code=("L['flag'] == 1",))
+        fn_id = fact("ID_MATCH", "G['fn']", value="is mod.fn", enforced=False)
+        # Same check as fn_id, only the filter's verdict differs.
+        fn_id_kept = fact("ID_MATCH", "G['fn']", value="is mod.fn")
+        frame = ("forward", "m.py", 12)
+
+        self.assertEqual(_varying_guard_slots({}), frozenset())
+        # One variant discriminates nothing.
+        self.assertEqual(
+            _varying_guard_slots({frame: [frozenset({x_f32, flag, fn_id})]}),
+            frozenset(),
+        )
+        varying = _varying_guard_slots(
+            {frame: [frozenset({x_f32, fn_id}), frozenset({x_f16, flag, fn_id_kept})]}
+        )
+        self.assertEqual(
+            varying,
+            frozenset({("TENSOR_MATCH", "L['x']"), ("CONSTANT_MATCH", "L['flag']")}),
+        )
+        # Frames are never compared with each other: the same slot pinned to
+        # different values in two frames is invariant within each.
+        other = ("torch_dynamo_resume_in_forward_at_14", "m.py", 14)
+        self.assertEqual(
+            _varying_guard_slots(
+                {frame: [frozenset({x_f32})], other: [frozenset({x_f16})]}
+            ),
+            frozenset(),
+        )
+
+    def test_summarize_reads_the_frame_lists_off_the_entry(self):
+        from torch._dynamo.package import (
+            _DynamoCacheEntry,
+            _DynamoCodeCacheEntry,
+            _GuardedCodeCacheEntry,
+            SerializedCode,
+            SourceInfo,
+        )
+        from torch._dynamo.precompile_package import _summarize
+
+        def entry(code, guarded=0, bypassed=False, entered=True, resume=False):
+            serialized = SerializedCode.from_code_object(code)
+            return _DynamoCodeCacheEntry(
+                python_code=serialized,
+                python_module=__name__,
+                function_names=[],
+                guarded_codes=[
+                    _GuardedCodeCacheEntry(guards_state=b"", dynamo_code=serialized)
+                    for _ in range(guarded)
+                ],
+                import_sources={},
+                backend_ids=[],
+                code_source=None,
+                install_to_global=resume,
+                has_compile_id=entered,
+                bypassed=bypassed,
+            )
+
+        # Three distinct code objects that share the name every nn.Module has.
+        class A:
+            def forward(self):
+                pass
+
+        class B:
+            def forward(self):
+                pass
+
+        class C:
+            def forward(self):
+                pass
+
+        def helper():
+            pass
+
+        def resume():
+            pass
+
+        codes = [
+            entry(A.forward.__code__, guarded=1),
+            entry(B.forward.__code__),
+            entry(C.forward.__code__),
+            entry(helper.__code__, bypassed=True),
+            # Generated but never executed: no compile id, so not a gap.
+            entry(resume.__code__, entered=False, resume=True),
+        ]
+        info = SourceInfo(inlined_sources=set())
+        cache = _DynamoCacheEntry(codes=codes, source_info=info, device_type="cpu")
+        summary = _summarize(
+            cache,
+            dropped=set(),
+            kept=set(),
+            policy_dropped=set(),
+            risky=set(),
+            truncated=frozenset({"forward (m.py:3)"}),
+            capture_errors=(),
+            guard_sets={},
+            dropped_code={},
+        )
+        # One bare co_name per frame: two uncovered forwards stay two, and the
+        # frame lists are drawn from the frames the count covers.
+        self.assertEqual(summary.frames, 5)
+        self.assertEqual(summary.resume_functions, 1)
+        self.assertEqual(summary.guarded_codes, 1)
+        self.assertEqual(summary.bypassed, ("helper",))
+        self.assertEqual(summary.uncovered_frames, ("forward", "forward"))
+        self.assertFalse(summary.complete)
+        self.assertExpectedInline(
+            str(summary),
+            """5 frames (1 from graph breaks), 1 guarded code, 0 backend graphs, 2 UNCOVERED: ['forward', 'forward'], >=1 TRUNCATED: ['forward (m.py:3)'], 1 BYPASSED: ['helper']""",
+        )
+
 
 instantiate_parametrized_tests(TestPrecompilePackage)
 
