@@ -205,6 +205,7 @@ it.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import io
 import logging
@@ -223,6 +224,7 @@ log = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
+    import os
     from collections.abc import Callable, Mapping
     from typing_extensions import Self
 
@@ -278,6 +280,11 @@ class PrecompileError(RuntimeError):
     input whose shape or memory format differs from the example (invariants 3 and 6).
     See Note [precompile programming model] in this module for the full contract.
     """
+
+    #: What the call that raised this returned, when it ran before the refusal:
+    #: an accumulating capture's step has already executed by the time its
+    #: artifact gate refuses, so the result rides on the error. ``None`` otherwise.
+    result: object = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -345,6 +352,44 @@ class Capture:
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         raise NotImplementedError
+
+
+class _MakeFxCapture(Capture):
+    r"""Single-shot capture: the :class:`MakeFxTracer` front-end.
+
+    A make_fx trace records the ATen ops of ONE execution of ``fn``, so this
+    captures exactly one call and refuses a second -- there is no notion of
+    guards or recompiled variants here, and thus nothing a further call could
+    add. The Dynamo front-end is what captures several calls, with the graph
+    breaks and recompilations between them.
+    """
+
+    def __init__(
+        self,
+        fn: Callable[..., object],
+        artifact_path: str | os.PathLike[str],
+        cache_path: str | os.PathLike[str],
+        *,
+        backend: str,
+        decompositions: dict | None,
+        training: bool,
+    ) -> None:
+        if isinstance(fn, functools.partial):
+            raise PrecompileError(
+                "precompile cannot capture a partial. Pass the underlying function "
+                "and give its bound arguments as call arguments."
+            )
+        self._module = PrecompiledModule(
+            fn, backend=backend, tracer="make_fx", decompositions=decompositions
+        )
+        self._artifact_path = artifact_path
+        self._cache_path = cache_path
+        self._training = training
+        self._traced = False
+        self._rendered: tuple[str, bytes] | None = None
+
+    def __enter__(self) -> Self:
+        return self
 
 
 def _dense_shape(t: object) -> tuple[int, ...] | None:
@@ -1473,9 +1518,10 @@ class PrecompiledModule(PrecompiledRunnable):
         tracer: str = "make_fx",
         decompositions: dict | None = None,
     ) -> None:
-        # ``fn`` is the whole computation: an nn.Module, or a callable that closes
-        # over the module(s) it uses (e.g. ``lambda x: model(x)``, or a training
-        # step that computes a loss and torch.autograd.grad).
+        # ``fn`` is the whole computation: an nn.Module, or a callable that takes the
+        # module(s) it uses as positional arguments (e.g. ``lambda m, x: m(x)``, or a
+        # training step that computes a loss and torch.autograd.grad); a module it
+        # closed over instead would be baked in as constants (invariant 1).
         self._fn = fn
         self._backend = backend
         self._tracer = tracer

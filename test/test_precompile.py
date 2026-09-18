@@ -390,6 +390,29 @@ class TestPrecompile(TestCase):
         with self.assertRaisesRegex(PrecompileError, "not runnable"):
             PrecompiledModule(lambda x: x)(1)
 
+    def test_precompile_error_result_defaults_to_none(self):
+        # Nothing ran before an ordinary refusal, so the error carries no result.
+        self.assertIsNone(PrecompileError("refused").result)
+
+    def test_make_fx_capture_refuses_a_partial(self):
+        # A partial hides its bound arguments from the capture, so it is refused
+        # up front with the fix, rather than failing later as a baked constant.
+        import functools
+
+        from torch._precompile import _MakeFxCapture
+
+        def step(model, x):
+            return model(x)
+
+        bound = functools.partial(step, torch.nn.Linear(2, 2))
+        kwargs = {"backend": "eager", "decompositions": None, "training": False}
+        with self.assertRaisesRegex(PrecompileError, "cannot capture a partial"):
+            _MakeFxCapture(bound, "m.py", "m.cache", **kwargs)
+        cap = _MakeFxCapture(step, "m.py", "m.cache", **kwargs)
+        self.assertIs(cap.__enter__(), cap)
+        self.assertFalse(cap._traced)
+        self.assertIsNone(cap._rendered)
+
     def test_decompositions_kwarg(self):
         # The decompositions table is threaded into make_fx during capture; a
         # custom decomposition is invoked and the result still matches eager.
