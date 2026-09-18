@@ -1083,33 +1083,20 @@ def _parse_artifact_metadata(python_code: str) -> dict[str, object]:
     executing it (exec'ing the inlined Inductor output would JIT the kernels, the
     very work the cache exists to skip).
 
-    python_code is the single source of truth: ``_build_metadata_section`` emits the
-    constants below as top-level literal assignments, so an AST walk + literal_eval
-    recovers them safely. The cache then only needs to carry the compiled artifact.
+    python_code is the single source of truth: the metadata builders emit the constants
+    below as top-level literal assignments, so an AST walk + literal_eval recovers them
+    safely. The cache then only needs to carry the compiled artifact.
+
+    The required constant set is tracer-dependent: the make_fx tracer emits the full
+    calling-convention set the inlined driver reads (PARAM_NAMES, OUT_SPEC, ...), while
+    the dynamo tracer's multi-graph driver rehydrates its frames from opaque blobs
+    (_FRAMES and _BACKENDS, or _PACKAGE once installed) and reads only the entry
+    binding and the readable frame report beside them (FN_NAME, FRAMES, the dropped
+    and risky guard lists). TRACER is absent on artifacts predating the dynamo tracer,
+    so its absence means make_fx.
     """
     import ast
 
-    wanted = {
-        "BACKEND",
-        "MODULE_POSITIONS",
-        "NUM_POSITIONAL_ARGS",
-        "PARAM_NAMES",
-        "BUFFER_NAMES",
-        "PARAM_SHAPES",
-        "BUFFER_SHAPES",
-        "PARAM_DTYPES",
-        "BUFFER_DTYPES",
-        "PARAM_DEVICES",
-        "BUFFER_DEVICES",
-        "GRAD_PARAM_INDICES",
-        "IN_SPEC",
-        "OUT_SPEC",
-        "USER_INPUT_SHAPES",
-        "USER_INPUT_DTYPES",
-        "USER_INPUT_DEVICES",
-        "USER_INPUT_BOUNDS",
-    }
-    found: dict[str, object] = {}
     try:
         tree = ast.parse(python_code)
     except SyntaxError as e:
@@ -1117,31 +1104,107 @@ def _parse_artifact_metadata(python_code: str) -> dict[str, object]:
             "python_code is not valid Python; it does not look like a "
             "torch.compiler.precompile artifact."
         ) from e
+    # The last top-level assignment to a name wins, as it would under exec, so the
+    # set selection below and the reported values read the same assignment.
+    assigns: dict[str, ast.expr] = {}
     for node in tree.body:
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-        if target.id in wanted:
-            found[target.id] = ast.literal_eval(node.value)
-        else:
-            # Not a metadata name we consume (the driver section emits only
-            # function defs today, but a future artifact revision could add a
-            # driver-internal top-level assignment). Skipped by design, but log
-            # it at debug so a malformed / renamed artifact is diagnosable
-            # rather than silently dropped.
-            log.debug(
-                "precompile: ignoring unrecognized top-level assignment %r while "
-                "parsing artifact calling-convention metadata",
-                target.id,
-            )
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            assigns[node.targets[0].id] = node.value
+
+    def literal(name: str) -> object:
+        try:
+            return ast.literal_eval(assigns[name])
+        except (ValueError, SyntaxError) as e:
+            raise PrecompileError(
+                f"python_code {name!r} calling-convention metadata is malformed; "
+                "it must be a Python literal."
+            ) from e
+
+    # The make_fx and dynamo drivers read different calling-convention literals,
+    # so TRACER picks the required set. It is absent on artifacts predating the
+    # dynamo tracer, which are all make_fx.
+    tracer = literal("TRACER") if "TRACER" in assigns else None
+    if tracer == "dynamo":
+        # The multi-graph driver rehydrates every frame from _FRAMES and the
+        # subgraphs from _BACKENDS; the readable literals beside them describe
+        # what is in those blobs and are presence-checked so a truncated
+        # artifact fails here rather than deep inside the driver.
+        wanted = {
+            "BACKEND",
+            "TRACER",
+            "FN_NAME",
+            "FRAMES",
+            "DROPPED_GUARDS",
+            "RISKY_DROPPED_GUARDS",
+            "WONT_GENERALIZE",
+            "_FRAMES",
+            "_BACKENDS",
+            "_DYNAMO_PYTHON_VERSION",
+            "_ENTRY_BINDING",
+            "TORCH_VERSION",
+        }
+        # An installed artifact carries the whole package in one blob instead of
+        # the per-frame records, so it reads a different set. SERVING_MODE is
+        # absent on artifacts predating it, which were all standalone.
+        mode = literal("SERVING_MODE") if "SERVING_MODE" in assigns else None
+        if mode == "installed":
+            wanted -= {"_FRAMES", "_BACKENDS"}
+            wanted |= {"SERVING_MODE", "_PACKAGE", "UNREACHABLE_WITHOUT_INSTALL"}
+    else:
+        wanted = {
+            "BACKEND",
+            "MODULE_POSITIONS",
+            "NUM_POSITIONAL_ARGS",
+            "PARAM_NAMES",
+            "BUFFER_NAMES",
+            "PARAM_SHAPES",
+            "BUFFER_SHAPES",
+            "PARAM_DTYPES",
+            "BUFFER_DTYPES",
+            "PARAM_DEVICES",
+            "BUFFER_DEVICES",
+            "GRAD_PARAM_INDICES",
+            "IN_SPEC",
+            "OUT_SPEC",
+            "USER_INPUT_SHAPES",
+            "USER_INPUT_DTYPES",
+            "USER_INPUT_DEVICES",
+            "USER_INPUT_BOUNDS",
+        }
+    # Parsed when present, never required, so artifacts predating each load
+    # unchanged: the serving mode and graph devices are read by the driver, and
+    # the guard-audit sections are reporting an auditor wants back as data
+    # rather than by grepping the source.
+    optional = {
+        "SERVING_MODE",
+        "GRAPH_DEVICES",
+        "POLICY_DROPPED_GUARDS",
+        "DROPPED_GUARD_CODE",
+    }
+    found = {name: literal(name) for name in assigns if name in wanted | optional}
+    for name in assigns.keys() - wanted - optional - {"forward"}:
+        # Not a metadata name we consume (``forward = ...`` is the multi-graph
+        # driver's own binding). Skipped by design, but log it at debug so a
+        # malformed / renamed artifact is diagnosable rather than silently
+        # dropped.
+        log.debug(
+            "precompile: ignoring unrecognized top-level assignment %r while "
+            "parsing artifact calling-convention metadata",
+            name,
+        )
     missing = wanted - found.keys()
     if missing:
         raise PrecompileError(
             f"python_code is missing calling-convention metadata {sorted(missing)}; "
             "it does not look like a torch.compiler.precompile artifact."
         )
+    # Artifacts predating the installed serving mode carry no SERVING_MODE, and
+    # they were all standalone.
+    found.setdefault("SERVING_MODE", "standalone")
     return found
 
 
