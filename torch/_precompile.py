@@ -1064,6 +1064,13 @@ def _build_metadata_section(buf: PySourceBuilder, compiled: PrecompiledModule) -
     # driver validates against it when present, else skips the structure check).
     buf.writeline(f"IN_SPEC = {in_spec_str!r}")
     buf.writeline(f"OUT_SPEC = {out_spec_str!r}")
+    # Every autocast-capable device type the captured graph dispatches on, read
+    # off the GRAPH rather than the runtime tensors (see _graph_device_types);
+    # the drivers neutralize ambient autocast on these. Artifacts written before
+    # this field carry their own, older driver, which never reads it.
+    if compiled._gm is None:
+        raise PrecompileError("internal: cannot build metadata before _compile()")
+    buf.writeline(f"GRAPH_DEVICES = {_graph_device_types(compiled._gm)!r}")
     # Per user-input-leaf example shape / dtype / device (None for a non-tensor /
     # subclass leaf); the drivers reject a runtime mismatch (invariants 3 and 6).
     # Memory-format mismatches are caught by the inductor artifact's own
@@ -1326,12 +1333,29 @@ def _emit_driver_source(forward_fn_name: str) -> str:
         inspect.getsource(driver._extract_param_buffers),
         inspect.getsource(driver._fail),
         inspect.getsource(driver._check_structure),
+        inspect.getsource(driver._autocast_off),
         inspect.getsource(forward_fn).replace(
             f"def {forward_fn_name}(", "def forward(", 1
         ),
     ]
     body = "\n\n".join(block.rstrip() for block in blocks)
     return "\n" + body + "\n\n\n" + _DRIVER_MAIN
+
+
+def _graph_device_types(gm: torch.fx.GraphModule) -> tuple[str, ...]:
+    """Every device type the graph dispatches on, from its node metadata.
+
+    Derived from the GRAPH, not from the runtime params and inputs: a graph can
+    reach a device none of its inputs live on (an explicit ``.to("cuda")`` in
+    the middle of fn), and a graph built only from factory ops has no input
+    device at all. Both cases leave a runtime scan blind exactly where an
+    ambient-state leak needs closing.
+    """
+    from torch._dynamo.graph_utils import _graph_device_types as _scan
+
+    return tuple(
+        sorted(d for d in _scan(gm.graph) if torch.amp.is_autocast_available(d))
+    )
 
 
 def _assert_supported(gm: torch.fx.GraphModule) -> None:

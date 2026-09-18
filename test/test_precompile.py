@@ -339,6 +339,40 @@ class TestPrecompile(TestCase):
         meta = _parse_artifact_metadata(src + "_x = f()\n")
         self.assertEqual(meta["TRACER"], "dynamo")
 
+    @parametrize("backend", ["eager", "inductor"])
+    def test_artifact_neutralizes_ambient_autocast(self, backend):
+        # The casts a capture ran under are baked into the artifact, but the graph
+        # still re-dispatches at serve time, so the driver runs it with autocast
+        # off on every device the GRAPH names and leaves the caller's autocast
+        # state as it found it. With no ambient autocast it enters no autocast
+        # context at all: leaving one clears the process-wide cast cache.
+        from unittest import mock
+
+        from torch._precompile import _parse_artifact_metadata, PrecompiledModule
+
+        model = torch.nn.Linear(4, 3)
+        x = torch.randn(5, 4)
+        compiled = PrecompiledModule(lambda m, x: m(x), backend=backend)
+        compiled._compile((model, x))
+        code = compiled.to_python_code()
+        self.assertIn("GRAPH_DEVICES = ('cpu',)", code)
+        meta = _parse_artifact_metadata(code)
+        self.assertEqual(meta["GRAPH_DEVICES"], ("cpu",))
+        self.assertEqual(meta["SERVING_MODE"], "standalone")
+        ns: dict[str, object] = {}
+        exec(code, ns)
+        forward = ns["forward"]
+        with mock.patch.object(torch, "clear_autocast_cache") as cleared:
+            expected = forward(model, x)
+        cleared.assert_not_called()
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            self.assertEqual(model(x).dtype, torch.bfloat16)
+            out = forward(model, x)
+            self.assertTrue(torch.is_autocast_enabled("cpu"))
+            self.assertEqual(torch.get_autocast_dtype("cpu"), torch.bfloat16)
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertEqual(out, expected)
+
     def test_decompositions_kwarg(self):
         # The decompositions table is threaded into make_fx during capture; a
         # custom decomposition is invoked and the result still matches eager.
