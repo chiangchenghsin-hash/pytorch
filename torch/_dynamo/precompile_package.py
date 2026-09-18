@@ -872,3 +872,94 @@ def _is_risky_drop(
             or _defined_where_read(value, source.global_name, stack)
         )
     return True
+
+
+# Guards that pin an input's SHAPE, VALUE or KIND, never policy-dropped even
+# when they held identically across every captured variant. A drop is licensed
+# by "it discriminated nothing", but with a single example nothing CAN
+# discriminate, and what would disappear is the check that the runtime input
+# looks like the captured one at all. A dropped shape guard crashes inside a
+# kernel on inductor and can quietly miscompute on eager; a dropped value guard
+# serves the captured branch to every other value with correct-looking numerics.
+_SHAPE_BEARING_GUARD_TYPES = frozenset(
+    {
+        "TENSOR_MATCH",
+        "SEQUENCE_LENGTH",
+        # Python values the graph specialized on: an int or bool argument,
+        # module.training, an .item() result, mask=None.
+        "CONSTANT_MATCH",
+        "EQUALS_MATCH",
+        # Pins that two inputs alias, so a graph traced under `x is y` is never
+        # served two distinct tensors.
+        "DUPLICATE_INPUT",
+        # hasattr is a branch like any other. Reachable on the DEFAULT gates: a
+        # single-variant capture makes every slot look invariant and the drop
+        # is not classed risky.
+        "HASATTR",
+        # An input's KIND: a graph traced for one class and served to another
+        # returns the first one's answer, with no shape to crash on. Upstream
+        # leans on this guard specifically: VariableBuilder.wrap_tensor relaxes
+        # an AsyncCollectiveTensor's class guards (UnwrapCollectiveTensorSource)
+        # so an ACT-traced graph serves the resolved tensor, and
+        # BuiltinVariable.call_isinstance reinstalls TYPE_MATCH where the class
+        # is observed. FAKE_SCRIPT_TYPE_MATCH is the same pin for a
+        # reference-type opaque object.
+        "TYPE_MATCH",
+        "FAKE_SCRIPT_TYPE_MATCH",
+        # The graph specialized on utils_device.CURRENT_DEVICE: captured under
+        # the default None and served under set_default_device("cuda"), it
+        # returns CPU tensors with no refusal.
+        "DEFAULT_DEVICE",
+        # Membership, key-set, length and iterator-position facts, each a branch
+        # the graph specialized on. A module-owned dict (self.opts = {}) is
+        # environment-rooted, which is exactly where a policy would drop it.
+        "BOOL_MATCH",
+        "CONSTANT_SUBCLASS_MATCH",
+        "COUNT_ITERATOR_MATCH",
+        "DICT_CONTAINS",
+        "DICT_KEYS_MATCH",
+        "DICT_NOT_CONTAINS",
+        "MAPPING_KEYS_CHECK",
+        "NONE_MATCH",
+        "NOT_NONE_MATCH",
+        "NOT_PRESENT_IN_GENERIC_DICT",
+        "RANGE_ITERATOR_MATCH",
+        "SET_CONTAINS",
+        "SET_NOT_CONTAINS",
+        "TUPLE_ITERATOR_LEN",
+        # A SEQUENCE_LENGTH on a module's hook dicts when
+        # skip_nnmodule_hook_guards is off, and nothing under the default: so
+        # either there is nothing to drop, or what there is pins a value.
+        "EMPTY_NN_MODULE_HOOKS_DICT",
+        # Pins a folded torch._C._is_cow_tensor branch. Kept, a capture that
+        # folded one fails at serialization with the builder's own error (the
+        # tensor comes back fake and COW_TENSOR_MATCH rejects that); dropped, it
+        # would serve the folded branch to the other kind of tensor silently.
+        "COW_TENSOR_MATCH",
+    }
+)
+
+
+# Guards whose C++ leaf compares something no fingerprint in this module reads:
+# subclass metadata, a DTensor placement, an opaque object's guard values, a raw
+# DispatchKeySet, the symbolic shape environment, or process-wide state the leaf
+# snapshots for itself (GlobalStateGuard's state, the torch-function mode
+# stack). Calling two of these equal is how the report ends up asserting a
+# precondition that does not hold, so they are never compared and are reported
+# as undetermined. They are never dropped either: a policy may drop only what
+# its droppable set names, and these are in no such set.
+_UNMODELLED_GUARD_TYPES = frozenset(
+    {
+        "DISPATCH_KEY_SET_MATCH",
+        "DTENSOR_SPEC_MATCH",
+        # Its builder is a no-op like GRAD_MODE's, but GlobalStateGuard does not
+        # snapshot FSDP training state and the state is per param group, so
+        # nothing here can model or vouch for it.
+        "FSDP_TRAINING_STATE",
+        "GLOBAL_STATE",
+        "OPAQUE_OBJ_GUARD_FN_MATCH",
+        "SHAPE_ENV",
+        "TENSOR_SUBCLASS_METADATA_MATCH",
+        "TORCH_FUNCTION_STATE",
+    }
+)
