@@ -34,6 +34,7 @@ import sysconfig
 import types
 from typing import TYPE_CHECKING
 
+import torch
 from torch._guards import ChainedSource
 from torch.utils._config_module import ConfigModule
 
@@ -874,6 +875,13 @@ def _is_risky_drop(
     return True
 
 
+# Guards whose check IS object identity, directly or through a derived guard,
+# which is the same test default_guard_filter_fn drops on.
+_IDENTITY_GUARD_TYPES = frozenset(
+    CheckFunctionManager.UNSUPPORTED_SERIALIZATION_GUARD_TYPES
+)
+
+
 # Guards that pin an input's SHAPE, VALUE or KIND, never policy-dropped even
 # when they held identically across every captured variant. A drop is licensed
 # by "it discriminated nothing", but with a single example nothing CAN
@@ -961,5 +969,46 @@ _UNMODELLED_GUARD_TYPES = frozenset(
         "SHAPE_ENV",
         "TENSOR_SUBCLASS_METADATA_MATCH",
         "TORCH_FUNCTION_STATE",
+    }
+)
+
+
+# Guard types whose GuardBuilder method is `pass`: the guard is a marker, and
+# the check it names is made by GLOBAL_STATE's leaf. Nothing about them is
+# serialized or dropped, so they never appear in a dropped-guard report --
+# listing GRAD_MODE as "a precondition nothing checks" would be false, since
+# GlobalStateGuard checks it on every call. Their facts ARE compared, from the
+# same process state GlobalStateGuard snapshots (see _value_fingerprint).
+_NOOP_GUARD_TYPES = frozenset({"DETERMINISTIC_ALGORITHMS", "GRAD_MODE"})
+
+
+def _is_noop_guard_type(guard_type: str) -> bool:
+    # EMPTY_NN_MODULE_HOOKS_DICT is classified shape-bearing for the config
+    # where it emits a check; under skip_nnmodule_hook_guards, the default,
+    # GuardBuilder emits nothing for it, so a report must not call it a
+    # precondition.
+    return guard_type in _NOOP_GUARD_TYPES or (
+        guard_type == "EMPTY_NN_MODULE_HOOKS_DICT"
+        and torch._dynamo.config.skip_nnmodule_hook_guards
+    )
+
+
+# The ONLY guard types the invariance policy may drop, and only when proven
+# invariant across every captured variant: the identity guards the default
+# filter drops anyway as unserializable, and process-wide compiler state. The
+# four sets are a total, disjoint classification of GuardBuilder's guard
+# methods, pinned by test_guard_policy_classification_is_total: a guard type in
+# none of them -- any type added to GuardBuilder after this list -- is KEPT
+# unconditionally until someone classifies it, so a new value-pinning guard can
+# never become silently droppable. Guards installed outside GuardBuilder (the
+# root manager's DuplicateInputs and StorageOverlap exprs, the dimension-marking
+# lambda) never reach the guard filter and are outside the policy as well.
+_INVARIANT_DROPPABLE_GUARD_TYPES = _IDENTITY_GUARD_TYPES | frozenset(
+    {
+        "AUTOGRAD_SAVED_TENSORS_HOOKS",
+        # An identity match on a builtin, which the default filter keeps.
+        "BUILTIN_MATCH",
+        "DUAL_LEVEL",
+        "FUNCTORCH_STACK_MATCH",
     }
 )
