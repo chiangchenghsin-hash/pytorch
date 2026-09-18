@@ -602,6 +602,81 @@ class TestPrecompile(TestCase):
         with self.assertRaisesRegex(PrecompileError, r"closes over \['scale'\]"):
             reject("step", [code_entry(step, variants=[variant])])
 
+    def test_multigraph_driver_dispatches_captured_frames(self):
+        # The standalone driver rebuilds each frame's f_locals for the guard
+        # check, so the shapes it has to bind are all here: a keyword-only
+        # default the call omits, *args, and a continuation closing over a cell
+        # of the entry frame (x, which rows() captures).
+        import inspect
+        from unittest import mock
+
+        from torch import _precompile_driver as driver
+        from torch._dynamo.package import CompilePackage, load_guards_state
+        from torch._dynamo.precompile_context import EagerCacheArtifact
+        from torch._dynamo.precompile_package import default_guard_filter_fn
+        from torch._precompile import _b64, _multigraph_frames
+
+        def step(model, x, *rest, scale=2.0):
+            y = model(x) * scale
+            torch._dynamo.graph_break()
+
+            def rows():
+                return x.shape[0]
+
+            return y + rows() + len(rest)
+
+        model = torch.nn.Linear(4, 4)
+        x = torch.randn(3, 4)
+        package = CompilePackage(step)
+        compiled = torch._dynamo.optimize(
+            backend="eager", package=package, guard_filter_fn=default_guard_filter_fn
+        )(step)
+        expected = compiled(model, x)
+        frames = _multigraph_frames(package.cache_entry())
+        backends = {
+            backend_id: EagerCacheArtifact(key=backend_id, content=backend)
+            for backend_id, backend in package.cached_backends.items()
+        }
+        torch._dynamo.reset()
+        # A serving process never traced, so the names Dynamo minted into this
+        # module during capture must not be what makes the guards pass.
+        scope = step.__globals__
+        minted = ("__compiled_fn", "__resume_at", "__builtins_dict__", "__import_")
+        for name in [name for name in scope if name.startswith(minted)]:
+            del scope[name]
+
+        ns = {
+            "__name__": "precompile_test_artifact",
+            "_FRAMES": _b64(frames),
+            "_BACKENDS": _b64(backends),
+            "_ENTRY_BINDING": _b64(
+                {"defaults": step.__defaults__, "kwdefaults": step.__kwdefaults__}
+            ),
+            "_DYNAMO_PYTHON_VERSION": tuple(sys.version_info[:2]),
+            "TORCH_VERSION": torch.__version__,
+        }
+        exec(inspect.getsource(driver._build_multigraph_forward), ns)
+        build = ns["_build_multigraph_forward"]
+        forward = build()
+        self.assertEqual(forward(model, x), expected)
+        self.assertEqual(forward(model, x, scale=2.0), expected)
+        guards_state = load_guards_state(frames[0]["variants"][0]["guards_state"])
+        key = guards_state.output_graph.name_of_builtins_dict_key_in_fglobals
+        self.assertIs(ns[key], ns["__builtins__"])
+        # Neither call was captured: the entry frame refuses the first, the
+        # continuation (guarding len(rest)) the second. There is no compiler
+        # behind the artifact, so both are coverage gaps rather than recompiles.
+        with self.assertRaisesRegex(PrecompileError, "no captured variant of 'step'"):
+            forward(model, x, scale=3.0)
+        resume_miss = "no captured variant of 'torch_dynamo_resume_in_step"
+        with self.assertRaisesRegex(PrecompileError, resume_miss):
+            forward(model, x, torch.ones(1))
+        foreign = (("_DYNAMO_PYTHON_VERSION", (3, 9)), ("TORCH_VERSION", "0.0"))
+        for name, value in foreign:
+            with mock.patch.dict(ns, {name: value}):
+                with self.assertRaisesRegex(PrecompileError, "Regenerate the artifact"):
+                    build()
+
     def test_decompositions_kwarg(self):
         # The decompositions table is threaded into make_fx during capture; a
         # custom decomposition is invoked and the result still matches eager.
